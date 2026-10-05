@@ -1,10 +1,12 @@
 /**
  * 拍摄进度：由实拍张数与废帧数计算镜头完成百分比与剩余张数。
+ * 登记实拍时把对应帧标记为已拍（跟着稳定身份走），并关联到具体帧。
  * 被 / 与 /progress 消费。
  */
 import { computed, ref } from 'vue';
 import * as api from '../db/api';
 import { useShotStore } from '../stores/shotStore';
+import { useFrameStore } from '../stores/frameStore';
 import { durationToFrames } from '../utils/frameMath';
 import type { Shot } from '../types/shot';
 import type { TakeLog, WasteBucket } from '../types/take';
@@ -32,6 +34,7 @@ export function computeProgress(planned: number, taken: number, wasted: number) 
 
 export function useProgress() {
   const shotStore = useShotStore();
+  const frameStore = useFrameStore();
   const takes = ref<TakeLog[]>([]);
   const loading = ref(false);
 
@@ -91,17 +94,33 @@ export function useProgress() {
     return { ...createEmptyTake(shot.id ?? 0, shot.code), remainingFrames: p.remaining, percent: p.percent };
   }
 
-  /** 登记一条实拍记录，并回写镜头完成百分比 */
+  /**
+   * 登记一条实拍记录，并把对应帧标记为已拍。
+   * 标记规则：按帧序取前 taken 张未拍帧（跟着稳定身份走）。
+   */
   async function registerTake(shot: Shot, date: string, takenFrames: number, wastedFrames: number) {
     const planned = durationToFrames(shot.durationSec, shot.fps);
     const rows = takes.value.filter((t) => t.shotId === shot.id);
     const prevTaken = rows.reduce((sum, r) => sum + (r.takenFrames || 0), 0);
     const prevWasted = rows.reduce((sum, r) => sum + (r.wastedFrames || 0), 0);
     const p = computeProgress(planned, prevTaken + takenFrames, prevWasted + wastedFrames);
+
+    // 确保帧 store 加载了该镜头的帧
+    if (frameStore.shotId !== shot.id) {
+      await frameStore.loadForShot(shot.id ?? 0);
+    }
+    // 取前 taken 张未拍帧
+    const unshot = frameStore.frames.filter((f) => !f.shot);
+    const shotUids = unshot.slice(0, takenFrames).map((f) => f.uid);
+    if (shotUids.length) {
+      await frameStore.markShot(shotUids);
+    }
+
     const row: TakeLog = {
       date,
       shotCode: shot.code,
       shotId: shot.id ?? 0,
+      frameUids: shotUids,
       takenFrames,
       wastedFrames,
       remainingFrames: p.remaining,

@@ -8,6 +8,7 @@ import { storeToRefs } from 'pinia';
 import { useShotStore } from '../stores/shotStore';
 import * as api from '../db/api';
 import { accumulateOffsets, buildCurvePoints, estimateSpeed } from '../utils/frameMath';
+import { propDisplayRange } from '../utils/batch';
 import { formatMm } from '../utils/format';
 import { FIXATION_OPTIONS, type Fixation, type PropState } from '../types/prop';
 import type { FrameEntry } from '../types/frame';
@@ -91,6 +92,12 @@ function resetForm() {
   form.value = { name: '', fromFrame: 1, toFrame: Math.max(1, orderedFrames.value.length), posX: 0, posY: 0, posZ: 0, rotation: 0, fixation: '支架' };
 }
 
+/** 道具区间显示（由稳定身份推导当前帧号） */
+function propRange(p: PropState): string {
+  const { fromFrame, toFrame } = propDisplayRange(p, frames.value);
+  return `${fromFrame} – ${toFrame}`;
+}
+
 function startEdit(row: PropState) {
   editingId.value = row.id ?? null;
   form.value = {
@@ -113,8 +120,18 @@ async function submit() {
   }
   const fromFrame = Math.max(1, Math.floor(form.value.fromFrame));
   const toFrame = Math.max(fromFrame, Math.floor(form.value.toFrame));
+  // 锚定到稳定身份：按当前帧号解析出对应的 uid
+  const fromUid = frames.value.find((f) => f.frameNo === fromFrame)?.uid ?? '';
+  const toUid = frames.value.find((f) => f.frameNo === toFrame)?.uid ?? '';
   if (editingId.value !== null) {
-    await api.updateProp(editingId.value, { ...form.value, name: form.value.name.trim(), fromFrame, toFrame });
+    await api.updateProp(editingId.value, {
+      ...form.value,
+      name: form.value.name.trim(),
+      fromFrame,
+      toFrame,
+      fromUid,
+      toUid,
+    });
     flash('已更新道具位移记录');
   } else {
     const payload: PropState = {
@@ -122,6 +139,8 @@ async function submit() {
       shotId: activeShotId.value,
       fromFrame,
       toFrame,
+      fromUid,
+      toUid,
       posX: form.value.posX,
       posY: form.value.posY,
       posZ: form.value.posZ,
@@ -146,12 +165,13 @@ async function removeProp(id: number | undefined) {
 /** 把道具位置按帧区间均匀展开，形成位移轨迹点 */
 const trajectoryPoints = computed(() =>
   props.value.map((p) => {
-    const span = Math.max(1, p.toFrame - p.fromFrame);
+    const { fromFrame, toFrame } = propDisplayRange(p, frames.value);
+    const span = Math.max(1, toFrame - fromFrame);
     return {
       id: p.id ?? 0,
       name: p.name,
-      from: p.fromFrame,
-      to: p.toFrame,
+      from: fromFrame,
+      to: toFrame,
       stepX: Math.round(((p.posX) / span) * 100) / 100,
       stepY: Math.round(((p.posY) / span) * 100) / 100,
       stepZ: Math.round(((p.posZ) / span) * 100) / 100,
@@ -237,7 +257,7 @@ const trajectoryPoints = computed(() =>
           <tbody>
             <tr v-for="p in props" :key="p.id">
               <td>{{ p.name }}</td>
-              <td class="mono">{{ p.fromFrame }} – {{ p.toFrame }}</td>
+              <td class="mono">{{ propRange(p) }}</td>
               <td>{{ formatMm(p.posX) }}</td>
               <td>{{ formatMm(p.posY) }}</td>
               <td>{{ formatMm(p.posZ) }}</td>

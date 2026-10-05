@@ -1,13 +1,16 @@
-/** 帧条目 store：条带选中、帧序数组、批量曝光、持久化 */
+/** 帧条目 store：条带选中、帧序数组、批量曝光、持久化、批次与待复核 */
 import { defineStore } from 'pinia';
 import * as api from '../db/api';
 import { toPlain } from '../db';
 import { accumulateOffsets, estimateSpeed, frameColor, framesToDuration } from '../utils/frameMath';
+import { checkReview, computeBatches, computeFramePropIds, type ShootBatch } from '../utils/batch';
 import type { BatchExposure, FrameEntry } from '../types/frame';
-import { createEmptyFrame } from '../types/frame';
+import { createEmptyFrame, generateUid } from '../types/frame';
+import type { PropState } from '../types/prop';
 
 interface FrameState {
   frames: FrameEntry[];
+  props: PropState[];
   shotId: number | null;
   selectedFrameNo: number | null;
   dirty: boolean;
@@ -16,6 +19,7 @@ interface FrameState {
 export const useFrameStore = defineStore('frame', {
   state: (): FrameState => ({
     frames: [],
+    props: [],
     shotId: null,
     selectedFrameNo: null,
     dirty: false,
@@ -40,23 +44,70 @@ export const useFrameStore = defineStore('frame', {
     durationAtFps(state) {
       return (fps: number) => framesToDuration(state.frames.length, fps);
     },
+    /** 拍摄批次（按 180 秒容量，同一道具区间不拆开） */
+    batches(state): ShootBatch[] {
+      return computeBatches(state.frames, state.props);
+    },
+    /** 待复核帧数 */
+    reviewCount(state): number {
+      return state.frames.filter((f) => f.review).length;
+    },
+    /** 已拍帧数 */
+    shotCount(state): number {
+      return state.frames.filter((f) => f.shot).length;
+    },
+    /** 批次容量（秒） */
+    batchCapacity(): number {
+      return 180;
+    },
   },
   actions: {
     async loadForShot(shotId: number) {
       this.shotId = shotId;
       this.frames = await api.listFrames(shotId);
+      this.props = await api.listProps(shotId);
       this.dirty = false;
       if (this.frames.length && !this.frames.some((f) => f.frameNo === this.selectedFrameNo)) {
         this.selectedFrameNo = this.frames[0].frameNo;
       }
     },
+    /** 仅重新加载道具区间（道具增删改后调用） */
+    async reloadProps() {
+      if (this.shotId === null) return;
+      this.props = await api.listProps(this.shotId);
+    },
     select(frameNo: number | null) {
       this.selectedFrameNo = frameNo;
     },
-    /** 整段帧序落库（脱代理后写入），帧序号按数组顺序重排 */
+    /**
+     * 整段帧序落库（脱代理后写入），帧序号按数组顺序重排。
+     * 落库前重算道具区间归属，并对已拍帧做待复核检查。
+     */
     async persist() {
       if (this.shotId === null) return;
-      const ordered = this.frames.map((f, idx) => ({ ...f, frameNo: idx + 1, shotId: this.shotId as number }));
+      const prevFrames = this.frames.map((f) => ({ ...f }));
+      const ordered = this.frames.map((f, idx) => ({
+        ...f,
+        frameNo: idx + 1,
+        shotId: this.shotId as number,
+        uid: f.uid || generateUid(),
+      }));
+      // 重算道具区间归属
+      const propIdsMap = computeFramePropIds(ordered, this.props);
+      for (const frame of ordered) {
+        frame.propIds = propIdsMap.get(frame.uid) ?? [];
+      }
+      // 待复核检查：已拍帧消失或离开原区间
+      const reviewMap = checkReview(prevFrames, ordered);
+      for (const frame of ordered) {
+        if (reviewMap.has(frame.uid)) {
+          frame.review = true;
+          frame.reviewReason = reviewMap.get(frame.uid) ?? '';
+        } else {
+          frame.review = false;
+          frame.reviewReason = '';
+        }
+      }
       await api.replaceShotFrames(this.shotId, toPlain(ordered));
       this.frames = await api.listFrames(this.shotId);
       this.dirty = false;
@@ -78,6 +129,7 @@ export const useFrameStore = defineStore('frame', {
           : {}),
         ...seed,
         frameNo: index + 1,
+        uid: generateUid(),
         id: undefined,
       };
       this.frames = [...this.frames.slice(0, index), merged, ...this.frames.slice(index)];
@@ -127,6 +179,26 @@ export const useFrameStore = defineStore('frame', {
         const { id, ...rest } = next;
         await api.updateFrame(id, toPlain(rest));
       }
+    },
+    /** 标记指定帧为已拍（按稳定身份） */
+    async markShot(uids: string[]) {
+      const uidSet = new Set(uids);
+      const now = Date.now();
+      this.frames = this.frames.map((f) => {
+        if (!uidSet.has(f.uid)) return f;
+        return { ...f, shot: true, shotAt: now, updatedAt: now };
+      });
+      await this.persist();
+    },
+    /** 清除某帧的待复核状态（用户已人工核对，直接落库不再触发复核检查） */
+    async clearReview(uid: string) {
+      if (this.shotId === null) return;
+      const idx = this.frames.findIndex((f) => f.uid === uid);
+      if (idx < 0) return;
+      const next = { ...this.frames[idx], review: false, reviewReason: '', updatedAt: Date.now() };
+      this.frames = this.frames.map((f, i) => (i === idx ? next : f));
+      const ordered = this.frames.map((f) => toPlain(f));
+      await api.replaceShotFrames(this.shotId, ordered);
     },
     /** 条带单帧颜色：按曝光与位移量着色 */
     colorOf(frame: FrameEntry): string {

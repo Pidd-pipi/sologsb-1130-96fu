@@ -10,10 +10,14 @@ export interface PropState {
   name: string;
   /** 所属镜头 id */
   shotId: number;
-  /** 适用帧区间起点 */
+  /** 适用帧区间起点（显示用，由 fromUid 推导） */
   fromFrame: number;
-  /** 适用帧区间终点 */
+  /** 适用帧区间终点（显示用，由 toUid 推导） */
   toFrame: number;
+  /** 起点帧稳定身份 */
+  fromUid: string;
+  /** 终点帧稳定身份 */
+  toUid: string;
   /** 位置 X（mm） */
   posX: number;
   /** 位置 Y（mm） */
@@ -32,6 +36,8 @@ export const createEmptyProp = (shotId: number): PropState => ({
   shotId,
   fromFrame: 1,
   toFrame: 24,
+  fromUid: '',
+  toUid: '',
   posX: 0,
   posY: 0,
   posZ: 0,

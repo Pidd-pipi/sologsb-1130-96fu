@@ -4,11 +4,13 @@
  *   v1 建 shots / frames
  *   v2 增加 props 表与 shotId 索引
  *   v3 增加 takes 表，并按实拍张数回填进度
+ *   v4 逐帧回填稳定身份 uid，为道具区间锚定 fromUid/toUid
  */
 import Dexie from 'dexie';
 import type { Table } from 'dexie';
 import type { Shot } from '../types/shot';
 import type { FrameEntry } from '../types/frame';
+import { generateUid } from '../types/frame';
 import type { PropState } from '../types/prop';
 import type { TakeLog } from '../types/take';
 
@@ -71,6 +73,46 @@ export class StopMotionDb extends Dexie {
           const total = Math.max(1, Math.ceil(shot.durationSec * shot.fps));
           const percent = Math.min(100, Math.round((take.takenFrames / total) * 100));
           await tx.table('takes').update(take.id, { percent });
+        }
+      });
+    this.version(4)
+      .stores({
+        shots: '++id, code, status, sceneName',
+        frames: '++id, shotId, frameNo, [shotId+frameNo], uid',
+        props: '++id, shotId, name, [shotId+fromFrame], fromUid, toUid',
+        takes: '++id, shotId, date, shotCode',
+      })
+      .upgrade(async (tx) => {
+        // v4：逐帧回填稳定身份 uid，并为道具区间锚定 fromUid/toUid
+        const frames = await tx.table('frames').toCollection().toArray();
+        const framesByShot = new Map<number, Map<number, string>>();
+        // 第一遍：生成 uid 并建立 shotId → frameNo → uid 映射
+        for (const frame of frames) {
+          const uid =
+            typeof frame.uid === 'string' && frame.uid ? frame.uid : generateUid();
+          if (!framesByShot.has(frame.shotId)) framesByShot.set(frame.shotId, new Map());
+          framesByShot.get(frame.shotId)!.set(frame.frameNo, uid);
+          if (typeof frame.uid !== 'string' || !frame.uid) {
+            await tx
+              .table('frames')
+              .update(frame.id, {
+                uid,
+                shot: false,
+                shotAt: null,
+                propIds: [],
+                review: false,
+                reviewReason: '',
+              });
+          }
+        }
+        // 第二遍：为道具区间锚定 fromUid/toUid（按当前帧号对应）
+        const props = await tx.table('props').toCollection().toArray();
+        for (const prop of props) {
+          const map = framesByShot.get(prop.shotId);
+          if (!map) continue;
+          const fromUid = map.get(prop.fromFrame) ?? '';
+          const toUid = map.get(prop.toFrame) ?? '';
+          await tx.table('props').update(prop.id, { fromUid, toUid });
         }
       });
   }

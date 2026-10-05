@@ -6,6 +6,8 @@ export const SHOT_COUNT_OPTIONS: ShotCount[] = [1, 2, 3];
 /** 帧条目：一帧的曝光参数、道具位移与实拍记录 */
 export interface FrameEntry {
   id?: number;
+  /** 稳定身份：跨重排/增删不变，用于关联实拍记录与道具区间 */
+  uid: string;
   /** 帧序号，从 1 开始，随排序重排 */
   frameNo: number;
   /** 所属镜头 id */
@@ -26,10 +28,29 @@ export interface FrameEntry {
   propOffsetMm: number;
   /** 备注 */
   note: string;
+  /** 是否已实拍（跟着稳定身份走，重排/增删不丢） */
+  shot: boolean;
+  /** 实拍时间戳 */
+  shotAt: number | null;
+  /** 实拍时所属的道具区间 id 快照（用于待复核判断） */
+  propIds: number[];
+  /** 是否待复核（原帧消失或离开原区间） */
+  review: boolean;
+  /** 待复核原因 */
+  reviewReason: string;
   updatedAt: number;
 }
 
+/** 生成稳定身份（优先 crypto.randomUUID，回退到时间戳+随机数） */
+export function generateUid(): string {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return crypto.randomUUID();
+  }
+  return `f-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
 export const createEmptyFrame = (shotId: number, frameNo: number): FrameEntry => ({
+  uid: generateUid(),
   frameNo,
   shotId,
   shotCount: 2,
@@ -40,6 +61,11 @@ export const createEmptyFrame = (shotId: number, frameNo: number): FrameEntry =>
   lighting: '主灯 + 柔光箱',
   propOffsetMm: 0,
   note: '',
+  shot: false,
+  shotAt: null,
+  propIds: [],
+  review: false,
+  reviewReason: '',
   updatedAt: Date.now(),
 });
 

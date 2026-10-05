@@ -47,6 +47,10 @@ const { draft: batch, reset: resetBatch } = useLocalDraft<BatchExposure>('frame-
 const activeShot = computed<Shot | undefined>(() => (activeShotId.value === null ? undefined : shotStore.byId(activeShotId.value)));
 const planned = computed(() => (activeShot.value ? durationToFrames(activeShot.value.durationSec, activeShot.value.fps) : 0));
 const ordered = computed(() => frames.value.slice().sort((a, b) => a.frameNo - b.frameNo));
+const batches = computed(() => frameStore.batches);
+const reviewCount = computed(() => frameStore.reviewCount);
+const shotFrameCount = computed(() => frameStore.shotCount);
+const batchCapacity = computed(() => frameStore.batchCapacity);
 const exposureOptions = EXPOSURE_OPTIONS;
 const apertureOptions = APERTURE_OPTIONS;
 const isoOptions = ISO_OPTIONS;
@@ -156,6 +160,9 @@ function shiftFrame(frame: FrameEntry, dir: -1 | 1) {
         <div class="stat"><span class="label">计划张数</span><span class="value">{{ planned }}</span></div>
         <div class="stat"><span class="label">当前时长</span><span class="value small">{{ totalDuration }} s</span></div>
         <div class="stat"><span class="label">帧率</span><span class="value small">{{ fps }} fps</span></div>
+        <div class="stat"><span class="label">批次数</span><span class="value">{{ batches.length }}</span><span class="hint">容量 {{ batchCapacity }}s</span></div>
+        <div class="stat"><span class="label">已拍帧</span><span class="value">{{ shotFrameCount }}</span></div>
+        <div class="stat" :class="{ 'stat-warn': reviewCount > 0 }"><span class="label">待复核</span><span class="value">{{ reviewCount }}</span></div>
       </div>
 
       <div class="panel">
@@ -167,7 +174,15 @@ function shiftFrame(frame: FrameEntry, dir: -1 | 1) {
             <button type="button" class="btn small" @click="syncShotRange">重算时长</button>
           </div>
         </div>
-        <FrameStrip :frames="ordered" :selected="selectedFrameNo" @update:selected="select" @reorder="doReorder" @patch="patchFrame" />
+        <FrameStrip :frames="ordered" :selected="selectedFrameNo" :batches="batches" @update:selected="select" @reorder="doReorder" @patch="patchFrame" />
+        <div v-if="batches.length" class="batch-legend">
+          <span class="muted">批次划分：</span>
+          <span v-for="b in batches" :key="b.batchNo" class="batch-chip" :class="b.status">
+            第{{ b.batchNo }}批 · {{ b.frameUids.length }}帧 · {{ b.capacitySec }}s
+            <template v-if="b.status === 'shot'"> · 已拍</template>
+            <template v-else-if="b.status === 'partial'"> · 部分</template>
+          </span>
+        </div>
       </div>
 
       <div class="two-panel">
@@ -422,5 +437,38 @@ h1 {
   border-radius: 8px;
   padding: 8px 12px;
   font-size: 13px;
+}
+.stat .hint {
+  font-size: 11px;
+  color: #8a94a6;
+}
+.stat.stat-warn {
+  background: #fff5f5;
+  border-color: #f5c6c6;
+}
+.stat.stat-warn .value {
+  color: #c45656;
+}
+.batch-legend {
+  margin-top: 10px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+}
+.batch-chip {
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: #eef1f6;
+  color: #5a6472;
+}
+.batch-chip.shot {
+  background: #e4f5ec;
+  color: #227a52;
+}
+.batch-chip.partial {
+  background: #fff3dc;
+  color: #a8730f;
 }
 </style>

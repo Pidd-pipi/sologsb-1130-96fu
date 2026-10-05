@@ -1,7 +1,8 @@
 <script setup lang="ts">
 /**
  * 进度总览：列出各镜头状态、帧数、预计时长与完成百分比，
- * 累计全片张数与待拍张数。消费 Shot、TakeLog、FrameEntry。
+ * 累计全片张数与待拍张数，并显示批次容量与待复核数。
+ * 消费 Shot、TakeLog、FrameEntry、PropState。
  */
 import { computed, onMounted, ref } from 'vue';
 import { useRouter } from 'vue-router';
@@ -9,13 +10,15 @@ import { storeToRefs } from 'pinia';
 import { useShotStore } from '../stores/shotStore';
 import { useFrameStore } from '../stores/frameStore';
 import { useProgress } from '../hooks/useProgress';
-import { listAllFrames } from '../db/api';
+import { listAllFrames, listAllProps } from '../db/api';
 import { framesToDuration } from '../utils/frameMath';
+import { BATCH_CAPACITY_SEC, computeBatches } from '../utils/batch';
 import { formatDateTime } from '../utils/format';
 import ShotProgress from '../components/common/ShotProgress.vue';
 import StatusTag from '../components/common/StatusTag.vue';
 import EmptyState from '../components/common/EmptyState.vue';
 import type { FrameEntry } from '../types/frame';
+import type { PropState } from '../types/prop';
 
 const router = useRouter();
 const shotStore = useShotStore();
@@ -24,24 +27,50 @@ const { shots } = storeToRefs(shotStore);
 const { summaries, overall, loadTakes, loading } = useProgress();
 
 const allFrames = ref<FrameEntry[]>([]);
+const allProps = ref<PropState[]>([]);
 
 onMounted(async () => {
   await shotStore.load();
   await loadTakes();
   allFrames.value = await listAllFrames();
+  allProps.value = await listAllProps();
 });
 
 const summaryOf = (shotId: number | undefined) => summaries.value.find((s) => s.shotId === shotId);
+
+/** 每个镜头的批次与待复核统计 */
+const batchInfo = computed(() => {
+  const map = new Map<number, { batchCount: number; reviewCount: number; shotCount: number; pendingCount: number }>();
+  for (const shot of shots.value) {
+    if (typeof shot.id !== 'number') continue;
+    const frames = allFrames.value.filter((f) => f.shotId === shot.id).sort((a, b) => a.frameNo - b.frameNo);
+    const props = allProps.value.filter((p) => p.shotId === shot.id);
+    const batches = computeBatches(frames, props);
+    const reviewCount = frames.filter((f) => f.review).length;
+    const shotCount = frames.filter((f) => f.shot).length;
+    const pendingCount = frames.length - shotCount;
+    map.set(shot.id, { batchCount: batches.length, reviewCount, shotCount, pendingCount });
+  }
+  return map;
+});
+
+const totalReview = computed(() =>
+  [...batchInfo.value.values()].reduce((sum, info) => sum + info.reviewCount, 0),
+);
 
 const rows = computed(() =>
   shots.value.map((shot) => {
     const frames = allFrames.value.filter((f) => f.shotId === shot.id);
     const summary = summaryOf(shot.id);
+    const info = batchInfo.value.get(shot.id ?? 0);
     return {
       shot,
       frameCount: frames.length,
       duration: framesToDuration(shot.endFrame - shot.startFrame + 1, shot.fps),
       summary,
+      batchCount: info?.batchCount ?? 0,
+      reviewCount: info?.reviewCount ?? 0,
+      shotFrameCount: info?.shotCount ?? 0,
     };
   }),
 );
@@ -94,6 +123,16 @@ function goDetail(id: number | undefined) {
         <span class="value">{{ waitingFrames }}</span>
         <span class="hint">整体完成 {{ overall.percent }}%</span>
       </div>
+      <div class="stat">
+        <span class="label">批次容量</span>
+        <span class="value">{{ BATCH_CAPACITY_SEC }}s</span>
+        <span class="hint">同一道具区间不拆开</span>
+      </div>
+      <div class="stat" :class="{ 'stat-warn': totalReview > 0 }">
+        <span class="label">待复核帧</span>
+        <span class="value">{{ totalReview }}</span>
+        <span class="hint">原帧消失或离开区间</span>
+      </div>
     </div>
 
     <div class="panel">
@@ -119,6 +158,8 @@ function goDetail(id: number | undefined) {
             <th>帧率</th>
             <th>帧区间</th>
             <th>帧条目</th>
+            <th>批次</th>
+            <th>待复核</th>
             <th>预计时长</th>
             <th>完成度</th>
             <th>负责人</th>
@@ -133,6 +174,11 @@ function goDetail(id: number | undefined) {
             <td>{{ row.shot.fps }} fps</td>
             <td class="mono">{{ row.shot.startFrame }} – {{ row.shot.endFrame }}</td>
             <td>{{ row.frameCount }}</td>
+            <td>{{ row.batchCount }} 批</td>
+            <td>
+              <span v-if="row.reviewCount > 0" class="review-badge">{{ row.reviewCount }}</span>
+              <span v-else class="muted">0</span>
+            </td>
             <td>{{ row.duration }} s</td>
             <td class="progress-cell">
               <ShotProgress
@@ -210,6 +256,26 @@ h1 {
 .stat .hint {
   font-size: 12px;
   color: #8a94a6;
+}
+.stat.stat-warn {
+  background: #fff5f5;
+  border-color: #f5c6c6;
+}
+.stat.stat-warn .value {
+  color: #c45656;
+}
+.review-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 22px;
+  height: 22px;
+  padding: 0 6px;
+  border-radius: 999px;
+  background: #fdecec;
+  color: #c45656;
+  font-size: 12px;
+  font-weight: 600;
 }
 .panel {
   background: #fff;

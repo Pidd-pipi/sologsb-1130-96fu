@@ -7,6 +7,8 @@ export interface TakeLog {
   shotCode: string;
   /** 关联镜头 id */
   shotId: number;
+  /** 本次实拍包含的帧稳定身份（关联到具体帧，重排不丢） */
+  frameUids: string[];
   /** 实拍张数 */
   takenFrames: number;
   /** 废帧数 */
@@ -22,6 +24,7 @@ export const createEmptyTake = (shotId: number, shotCode: string): TakeLog => ({
   date: new Date().toISOString().slice(0, 10),
   shotCode,
   shotId,
+  frameUids: [],
   takenFrames: 0,
   wastedFrames: 0,
   remainingFrames: 0,

@@ -13,6 +13,7 @@ import { useFrameSequence } from '../hooks/useFrameSequence';
 import { useProgress } from '../hooks/useProgress';
 import * as api from '../db/api';
 import { durationToFrames, estimateSpeed, framesToDuration } from '../utils/frameMath';
+import { propDisplayRange } from '../utils/batch';
 import { FIXATION_OPTIONS, type Fixation, type PropState } from '../types/prop';
 import { SHOT_STATUS_OPTIONS, type ShotStatus } from '../types/shot';
 import type { FrameEntry } from '../types/frame';
@@ -47,6 +48,10 @@ const summary = computed(() => summaries.value.find((s) => s.shotId === shotId.v
 const sceneProgress = computed(() =>
   shot.value ? framesToDuration(shot.value.endFrame - shot.value.startFrame + 1, shot.value.fps) : 0,
 );
+const batches = computed(() => frameStore.batches);
+const reviewCount = computed(() => frameStore.reviewCount);
+const shotFrameCount = computed(() => frameStore.shotCount);
+const batchCapacity = computed(() => frameStore.batchCapacity);
 const statusOptions = SHOT_STATUS_OPTIONS;
 const fixationOptions = FIXATION_OPTIONS;
 const shotCountOptions = SHOT_COUNT_OPTIONS;
@@ -138,6 +143,11 @@ async function removeFrameRow(frameNo: number) {
   flash('已删除该帧并重排序号');
 }
 
+async function clearReview(uid: string) {
+  await frameStore.clearReview(uid);
+  flash('已清除待复核状态');
+}
+
 async function submitTake() {
   if (!shot.value) return;
   const taken = Math.max(0, Math.floor(takeForm.value.takenFrames));
@@ -157,11 +167,18 @@ async function addProp() {
     flash('请填写道具名');
     return;
   }
+  const fromFrame = Math.max(1, Math.floor(propForm.value.fromFrame));
+  const toFrame = Math.max(1, Math.floor(propForm.value.toFrame));
+  // 锚定到稳定身份：按当前帧号解析出对应的 uid
+  const fromUid = frames.value.find((f) => f.frameNo === fromFrame)?.uid ?? '';
+  const toUid = frames.value.find((f) => f.frameNo === toFrame)?.uid ?? '';
   const payload: PropState = {
     name: propForm.value.name.trim(),
     shotId: shotId.value,
-    fromFrame: Math.max(1, Math.floor(propForm.value.fromFrame)),
-    toFrame: Math.max(1, Math.floor(propForm.value.toFrame)),
+    fromFrame,
+    toFrame,
+    fromUid,
+    toUid,
     posX: propForm.value.posX,
     posY: propForm.value.posY,
     posZ: propForm.value.posZ,
@@ -171,6 +188,7 @@ async function addProp() {
   };
   const id = await api.addProp(payload);
   props.value = [...props.value, { ...payload, id }];
+  await frameStore.reloadProps();
   propForm.value.name = '';
   flash('已登记道具状态');
 }
@@ -179,11 +197,21 @@ async function removeProp(id: number | undefined) {
   if (typeof id !== 'number') return;
   await api.deleteProp(id);
   props.value = props.value.filter((p) => p.id !== id);
+  await frameStore.reloadProps();
 }
 
-/** 按帧号查询该帧上的道具位置（对应 PropState 的帧区间查询动作） */
+/** 按帧号查询该帧上的道具位置（由稳定身份推导当前帧号） */
 function propsAtFrame(frameNo: number): PropState[] {
-  return props.value.filter((p) => frameNo >= p.fromFrame && frameNo <= p.toFrame);
+  return props.value.filter((p) => {
+    const { fromFrame, toFrame } = propDisplayRange(p, frames.value);
+    return frameNo >= fromFrame && frameNo <= toFrame;
+  });
+}
+
+/** 道具区间显示（由稳定身份推导当前帧号） */
+function propRange(p: PropState): string {
+  const { fromFrame, toFrame } = propDisplayRange(p, frames.value);
+  return `${fromFrame} – ${toFrame}`;
 }
 
 const selectedProps = computed(() => (selectedFrameNo.value === null ? [] : propsAtFrame(selectedFrameNo.value)));
@@ -288,15 +316,31 @@ function speedOf(frame: FrameEntry) {
         <FrameStrip
           :frames="frames"
           :selected="selectedFrameNo"
+          :batches="batches"
           @update:selected="select"
           @reorder="reorder"
           @patch="patchFrame"
         />
+        <div v-if="batches.length" class="batch-legend">
+          <span class="muted">批次划分（容量 {{ batchCapacity }}s，同一道具区间不拆开）：</span>
+          <span v-for="b in batches" :key="b.batchNo" class="batch-chip" :class="b.status">
+            第{{ b.batchNo }}批 · {{ b.frameUids.length }}帧 · {{ b.capacitySec }}s
+            <template v-if="b.status === 'shot'"> · 已拍</template>
+            <template v-else-if="b.status === 'partial'"> · 部分已拍</template>
+          </span>
+        </div>
         <div v-if="selectedFrameNo !== null" class="prop-lookup" data-testid="prop-lookup">
           <strong>第 {{ selectedFrameNo }} 帧道具位置：</strong>
           <span v-if="!selectedProps.length" class="muted">该帧区间内没有已登记道具</span>
           <span v-for="p in selectedProps" :key="p.id" class="chip">
             {{ p.name }} ({{ p.posX }}, {{ p.posY }}, {{ p.posZ }}) mm · 旋转 {{ p.rotation }}°
+          </span>
+        </div>
+        <div v-if="reviewCount > 0" class="review-bar">
+          <span class="review-title">待复核帧（{{ reviewCount }}）：</span>
+          <span v-for="f in frames.filter((x) => x.review)" :key="f.uid" class="review-chip" :title="f.reviewReason">
+            第{{ f.frameNo }}帧 · {{ f.reviewReason }}
+            <button type="button" class="review-clear" @click="clearReview(f.uid)">清除</button>
           </span>
         </div>
       </div>
@@ -399,7 +443,7 @@ function speedOf(frame: FrameEntry) {
           <tbody>
             <tr v-for="p in props" :key="p.id">
               <td>{{ p.name }}</td>
-              <td class="mono">{{ p.fromFrame }} – {{ p.toFrame }}</td>
+              <td class="mono">{{ propRange(p) }}</td>
               <td>{{ p.posX }}</td>
               <td>{{ p.posY }}</td>
               <td>{{ p.posZ }}</td>
@@ -619,5 +663,61 @@ h1 .mono {
   border-radius: 8px;
   padding: 8px 12px;
   font-size: 13px;
+}
+.batch-legend {
+  margin-top: 10px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+}
+.batch-chip {
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: #eef1f6;
+  color: #5a6472;
+}
+.batch-chip.shot {
+  background: #e4f5ec;
+  color: #227a52;
+}
+.batch-chip.partial {
+  background: #fff3dc;
+  color: #a8730f;
+}
+.review-bar {
+  margin-top: 10px;
+  padding: 8px 10px;
+  background: #fff5f5;
+  border: 1px solid #f5c6c6;
+  border-radius: 8px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+}
+.review-title {
+  font-size: 12px;
+  color: #c45656;
+  font-weight: 600;
+}
+.review-chip {
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: #fdecec;
+  color: #c45656;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.review-clear {
+  border: none;
+  background: none;
+  color: #2f6fed;
+  cursor: pointer;
+  font-size: 11px;
+  padding: 0;
 }
 </style>
