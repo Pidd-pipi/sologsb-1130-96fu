@@ -3,6 +3,7 @@ import { defineStore } from 'pinia';
 import * as api from '../db/api';
 import { toPlain } from '../db';
 import { accumulateOffsets, estimateSpeed, frameColor, framesToDuration } from '../utils/frameMath';
+import { newFrameUid } from '../utils/identity';
 import type { BatchExposure, FrameEntry } from '../types/frame';
 import { createEmptyFrame } from '../types/frame';
 
@@ -53,16 +54,21 @@ export const useFrameStore = defineStore('frame', {
     select(frameNo: number | null) {
       this.selectedFrameNo = frameNo;
     },
-    /** 整段帧序落库（脱代理后写入），帧序号按数组顺序重排 */
+    /** 整段帧序按 uid 差量落库，帧序号按数组顺序重排（已拍帧凭 uid 继续跟着原帧） */
     async persist() {
       if (this.shotId === null) return;
-      const ordered = this.frames.map((f, idx) => ({ ...f, frameNo: idx + 1, shotId: this.shotId as number }));
-      await api.replaceShotFrames(this.shotId, toPlain(ordered));
-      this.frames = await api.listFrames(this.shotId);
+      const ordered = this.frames.map((f, idx) => ({
+        ...f,
+        uid: f.uid || newFrameUid(),
+        frameNo: idx + 1,
+        shotId: this.shotId as number,
+      }));
+      const saved = await api.syncShotFrames(this.shotId, toPlain(ordered));
+      this.frames = saved;
       this.dirty = false;
     },
     async insertAt(index: number, seed?: Partial<FrameEntry>) {
-      const base = createEmptyFrame(this.shotId ?? 0, index + 1);
+      const base = createEmptyFrame(this.shotId ?? 0, index + 1, newFrameUid());
       const anchor = this.frames[index - 1] ?? this.frames[0];
       const merged: FrameEntry = {
         ...base,
@@ -77,6 +83,7 @@ export const useFrameStore = defineStore('frame', {
             }
           : {}),
         ...seed,
+        uid: base.uid,
         frameNo: index + 1,
         id: undefined,
       };

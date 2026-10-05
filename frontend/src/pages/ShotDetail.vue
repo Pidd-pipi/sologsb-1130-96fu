@@ -11,18 +11,24 @@ import { useShotStore } from '../stores/shotStore';
 import { useFrameStore } from '../stores/frameStore';
 import { useFrameSequence } from '../hooks/useFrameSequence';
 import { useProgress } from '../hooks/useProgress';
+import { useShotBatches } from '../hooks/useShotBatches';
 import * as api from '../db/api';
 import { durationToFrames, estimateSpeed, framesToDuration } from '../utils/frameMath';
 import { FIXATION_OPTIONS, type Fixation, type PropState } from '../types/prop';
 import { SHOT_STATUS_OPTIONS, type ShotStatus } from '../types/shot';
 import type { FrameEntry } from '../types/frame';
 import { SHOT_COUNT_OPTIONS } from '../types/frame';
+import type { BatchView } from '../utils/batchMath';
+import type { BatchCardData } from '../components/common/BatchPanel.vue';
+import type { TakeLog } from '../types/take';
 import { today } from '../utils/format';
 import FrameStrip from '../components/common/FrameStrip.vue';
 import ExposureForm from '../components/common/ExposureForm.vue';
 import ShotProgress from '../components/common/ShotProgress.vue';
 import StatusTag from '../components/common/StatusTag.vue';
 import EmptyState from '../components/common/EmptyState.vue';
+import BatchPanel from '../components/common/BatchPanel.vue';
+import ReviewQueue from '../components/common/ReviewQueue.vue';
 
 const route = useRoute();
 const router = useRouter();
@@ -33,6 +39,27 @@ const { frames, selectedFrameNo } = storeToRefs(frameStore);
 const { insertAfter, removeAt, move, patch, select, syncShotRange } = useFrameSequence();
 const { registerTake, summaries, loadTakes, computeProgress } = useProgress();
 
+const shotId = computed(() => Number(route.params.id));
+/** 批次编排：frames 直接复用 frameStore 的帧序，帧序一改未拍批次立即重算 */
+const {
+  batchViews,
+  reviewItems,
+  reviewCount,
+  shotBatchCount,
+  capacitySec,
+  usedSec,
+  overflowCount,
+  capacityLimit,
+  invalidatedCount,
+  reconcile,
+  load: loadBatches,
+  registerBatch,
+  resolveReview,
+  discardReview,
+  frameState,
+  clearInvalidationNotice,
+} = useShotBatches(shotId, { frames });
+
 const props = ref<PropState[]>([]);
 const takeForm = ref({ date: today(), takenFrames: 8, wastedFrames: 0 });
 const propForm = ref({ name: '', fromFrame: 1, toFrame: 12, posX: 0, posY: 0, posZ: 0, rotation: 0, fixation: '支架' as Fixation });
@@ -40,7 +67,6 @@ const exposureDraft = ref<Partial<FrameEntry>>({});
 const feedback = ref('');
 const notFound = ref(false);
 
-const shotId = computed(() => Number(route.params.id));
 const shot = computed(() => shotStore.byId(shotId.value));
 const planned = computed(() => (shot.value ? durationToFrames(shot.value.durationSec, shot.value.fps) : 0));
 const summary = computed(() => summaries.value.find((s) => s.shotId === shotId.value));
@@ -62,6 +88,7 @@ async function bootstrap(id: number) {
   await frameStore.loadForShot(id);
   await loadTakes();
   props.value = await api.listProps(id);
+  await loadBatches();
   if (typeof row.id === 'number') shotStore.currentId = row.id;
   const first = frames.value[0];
   exposureDraft.value = first
@@ -90,6 +117,41 @@ function flash(text: string) {
   }, 3200);
 }
 
+/** 帧序变化后对账：未拍批次失效重算（已在派生视图中完成），已拍帧跟随原帧并复核错位 */
+async function afterSequenceChange(baseText: string) {
+  await reconcile();
+  const n = invalidatedCount.value;
+  clearInvalidationNotice();
+  flash(n > 0 ? `${baseText}；${n} 个未拍批次已失效重算` : baseText);
+}
+
+async function shootBatch(batch: BatchCardData, date: string) {
+  const { added } = await registerBatch(batch as BatchView, date);
+  await loadTakes();
+  flash(added > 0 ? `已为批次 ${batch.index} 的 ${added} 个帧逐帧登记实拍` : '该批次帧均已拍，未重复登记');
+}
+
+async function onResolveReview(take: TakeLog) {
+  await resolveReview(take);
+  await loadTakes();
+  flash('已确认，该实拍记录恢复正常');
+}
+
+async function onDiscardReview(take: TakeLog) {
+  await discardReview(take);
+  await loadTakes();
+  flash('已弃用该实拍记录，不计入张数');
+}
+
+function takeStateMap() {
+  const map: Record<string, NonNullable<ReturnType<typeof frameState>>> = {};
+  for (const f of frames.value) {
+    const state = frameState(f.uid);
+    if (state) map[f.uid] = state;
+  }
+  return map;
+}
+
 async function changeStatus(status: ShotStatus) {
   if (!shot.value) return;
   await shotStore.setStatus(shotId.value, status);
@@ -99,13 +161,14 @@ async function changeStatus(status: ShotStatus) {
 async function changeDuration(value: number) {
   if (!shot.value) return;
   await shotStore.update(shotId.value, { durationSec: value });
+  await reconcile();
   flash('已按新时长重排帧区间');
 }
 
 async function changeFps(value: number) {
-  if (!shot.value) return;
   await shotStore.update(shotId.value, { fps: value });
   await syncShotRange();
+  await reconcile();
   flash('已按新帧率重排帧区间');
 }
 
@@ -116,12 +179,12 @@ async function addFrameWithExposure() {
     await patch(last.frameNo, exposureDraft.value as Partial<FrameEntry>);
     select(last.frameNo);
   }
-  flash('已在帧序中插入一帧');
+  await afterSequenceChange('已在帧序中插入一帧');
 }
 
 async function reorder(from: number, to: number) {
   await move(from, to);
-  flash('已移动帧并重排序号');
+  await afterSequenceChange('已移动帧并重排序号');
 }
 
 async function patchFrame(frameNo: number, value: Partial<FrameEntry>) {
@@ -135,7 +198,7 @@ async function editCell(frame: FrameEntry, key: keyof FrameEntry, raw: string, n
 
 async function removeFrameRow(frameNo: number) {
   await removeAt(frameNo);
-  flash('已删除该帧并重排序号');
+  await afterSequenceChange('已删除该帧并重排序号');
 }
 
 async function submitTake() {
@@ -172,13 +235,15 @@ async function addProp() {
   const id = await api.addProp(payload);
   props.value = [...props.value, { ...payload, id }];
   propForm.value.name = '';
-  flash('已登记道具状态');
+  await reconcile();
+  flash('已登记道具状态，批次已按道具区间重算');
 }
 
 async function removeProp(id: number | undefined) {
   if (typeof id !== 'number') return;
   await api.deleteProp(id);
   props.value = props.value.filter((p) => p.id !== id);
+  await reconcile();
 }
 
 /** 按帧号查询该帧上的道具位置（对应 PropState 的帧区间查询动作） */
@@ -288,6 +353,7 @@ function speedOf(frame: FrameEntry) {
         <FrameStrip
           :frames="frames"
           :selected="selectedFrameNo"
+          :take-states="takeStateMap()"
           @update:selected="select"
           @reorder="reorder"
           @patch="patchFrame"
@@ -299,6 +365,32 @@ function speedOf(frame: FrameEntry) {
             {{ p.name }} ({{ p.posX }}, {{ p.posY }}, {{ p.posZ }}) mm · 旋转 {{ p.rotation }}°
           </span>
         </div>
+      </div>
+
+      <div class="panel" data-testid="batch-section">
+        <div class="panel-head">
+          <h2>拍摄批次</h2>
+          <span class="muted">
+            每批 {{ capacityLimit }} 秒容量 · 同一道具区间不拆开 · 已拍 {{ shotBatchCount }}/{{ batchViews.length }} 批
+            <template v-if="reviewCount"> · <strong class="review-link">待复核 {{ reviewCount }} 条</strong></template>
+          </span>
+        </div>
+        <BatchPanel
+          :batches="batchViews"
+          :used-sec="usedSec"
+          :capacity-sec="capacitySec"
+          :capacity-limit="capacityLimit"
+          :overflow-count="overflowCount"
+          @shoot="shootBatch"
+        />
+      </div>
+
+      <div v-if="reviewCount" class="panel review-panel" data-testid="review-section">
+        <div class="panel-head">
+          <h2>待复核（{{ reviewCount }}）</h2>
+          <span class="muted">帧序改动后实拍记录与原帧 / 道具区间错位，需人工确认</span>
+        </div>
+        <ReviewQueue :items="reviewItems" @resolve="onResolveReview" @discard="onDiscardReview" />
       </div>
 
       <div class="panel">
@@ -314,6 +406,7 @@ function speedOf(frame: FrameEntry) {
           <thead>
             <tr>
               <th>帧号</th>
+              <th>实拍</th>
               <th>张数</th>
               <th>曝光 s</th>
               <th>光圈</th>
@@ -326,8 +419,13 @@ function speedOf(frame: FrameEntry) {
             </tr>
           </thead>
           <tbody>
-            <tr v-for="frame in frames" :key="frame.id ?? frame.frameNo" :class="{ active: frame.frameNo === selectedFrameNo }" @click="select(frame.frameNo)">
+            <tr v-for="frame in frames" :key="frame.uid ?? frame.frameNo" :class="{ active: frame.frameNo === selectedFrameNo }" @click="select(frame.frameNo)">
               <td class="mono">{{ frame.frameNo }}</td>
+              <td>
+                <span v-if="frameState(frame.uid)?.reviewStatus === '待复核'" class="take-badge review" :title="frameState(frame.uid)?.reviewNote">⚠ 待复核</span>
+                <span v-else-if="frameState(frame.uid)" class="take-badge shot" :title="`${frameState(frame.uid)?.date} 实拍`">✓ {{ frameState(frame.uid)?.takenFrames }} 张</span>
+                <span v-else class="muted">未拍</span>
+              </td>
               <td>
                 <select :value="frame.shotCount" @change="editCell(frame, 'shotCount', ($event.target as HTMLSelectElement).value)">
                   <option v-for="c in shotCountOptions" :key="c" :value="c">{{ c }}</option>
@@ -341,7 +439,7 @@ function speedOf(frame: FrameEntry) {
               <td><input type="number" min="-200" max="200" step="0.5" :value="frame.propOffsetMm" @change="editCell(frame, 'propOffsetMm', ($event.target as HTMLInputElement).value)" /></td>
               <td class="muted">{{ speedOf(frame) }} mm/s</td>
               <td class="row-actions">
-                <button type="button" class="btn tiny" @click.stop="insertAfter(frame.frameNo)">后插</button>
+                <button type="button" class="btn tiny" @click.stop="insertAfter(frame.frameNo); afterSequenceChange('已在该帧后插入一帧')">后插</button>
                 <button type="button" class="btn tiny danger" :disabled="frames.length <= 1" @click.stop="removeFrameRow(frame.frameNo)">删除</button>
               </td>
             </tr>
@@ -619,5 +717,26 @@ h1 .mono {
   border-radius: 8px;
   padding: 8px 12px;
   font-size: 13px;
+}
+.review-panel {
+  border-color: #f0d4c8;
+  background: #fffdfb;
+}
+.review-link {
+  color: #c45656;
+}
+.take-badge {
+  font-size: 12px;
+  border-radius: 999px;
+  padding: 1px 9px;
+  white-space: nowrap;
+}
+.take-badge.shot {
+  background: #def3e8;
+  color: #2c7c55;
+}
+.take-badge.review {
+  background: #fdeaea;
+  color: #c45656;
 }
 </style>

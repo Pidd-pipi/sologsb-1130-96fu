@@ -99,6 +99,7 @@ export function useProgress() {
     const prevWasted = rows.reduce((sum, r) => sum + (r.wastedFrames || 0), 0);
     const p = computeProgress(planned, prevTaken + takenFrames, prevWasted + wastedFrames);
     const row: TakeLog = {
+      uid: '',
       date,
       shotCode: shot.code,
       shotId: shot.id ?? 0,
@@ -106,6 +107,8 @@ export function useProgress() {
       wastedFrames,
       remainingFrames: p.remaining,
       percent: p.percent,
+      reviewStatus: '正常',
+      active: true,
       updatedAt: Date.now(),
     };
     const id = await api.addTake(row);

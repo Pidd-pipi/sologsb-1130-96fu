@@ -6,6 +6,12 @@ export const SHOT_COUNT_OPTIONS: ShotCount[] = [1, 2, 3];
 /** 帧条目：一帧的曝光参数、道具位移与实拍记录 */
 export interface FrameEntry {
   id?: number;
+  /**
+   * 稳定身份：不随帧序变化的字符串 id。
+   * 插入 / 拖动 / 删除后 frameNo 会重排，但 uid 终生不变，
+   * 实拍记录、道具区间归属与拍摄批次都通过 uid 追踪帧。
+   */
+  uid: string;
   /** 帧序号，从 1 开始，随排序重排 */
   frameNo: number;
   /** 所属镜头 id */
@@ -29,7 +35,8 @@ export interface FrameEntry {
   updatedAt: number;
 }
 
-export const createEmptyFrame = (shotId: number, frameNo: number): FrameEntry => ({
+export const createEmptyFrame = (shotId: number, frameNo: number, uid: string): FrameEntry => ({
+  uid,
   frameNo,
   shotId,
   shotCount: 2,

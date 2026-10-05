@@ -8,10 +8,14 @@ import { storeToRefs } from 'pinia';
 import { useShotStore } from '../stores/shotStore';
 import { useProgress } from '../hooks/useProgress';
 import { formatDateTime, today } from '../utils/format';
+import { listAllFrames, listAllProps } from '../db/api';
+import { reconcileTakes } from '../utils/batchMath';
 import ShotProgress from '../components/common/ShotProgress.vue';
 import StatusTag from '../components/common/StatusTag.vue';
 import EmptyState from '../components/common/EmptyState.vue';
 import type { TakeLog } from '../types/take';
+import type { FrameEntry } from '../types/frame';
+import type { PropState } from '../types/prop';
 
 const shotStore = useShotStore();
 const { shots } = storeToRefs(shotStore);
@@ -20,6 +24,8 @@ const { takes, summaries, overall, wasteBuckets, loadTakes, registerTake, remove
 const selectedShotId = ref<number | null>(null);
 const form = ref({ date: today(), takenFrames: 8, wastedFrames: 0 });
 const feedback = ref('');
+const reviewCount = ref(0);
+const orphanCount = ref(0);
 
 const selectedShot = computed(() => (selectedShotId.value === null ? undefined : shotStore.byId(selectedShotId.value)));
 const selectedSummary = computed(() => summaries.value.find((s) => s.shotId === selectedShotId.value));
@@ -29,6 +35,11 @@ onMounted(async () => {
   await loadTakes();
   const first = shots.value[0];
   if (first && typeof first.id === 'number') selectedShotId.value = first.id;
+  // 跨镜头统计待复核帧级实拍（原帧消失或离开原道具区间）
+  const [allFrames, allProps] = await Promise.all([listAllFrames(), listAllProps()]);
+  const result = reconcileTakes(takes.value as TakeLog[], allFrames as FrameEntry[], allProps as PropState[]);
+  reviewCount.value = result.reviewCount;
+  orphanCount.value = result.orphanCount;
 });
 
 function flash(text: string) {
@@ -78,6 +89,9 @@ async function removeRow(row: TakeLog) {
         <span>全片完成度</span>
         <strong>{{ overall.percent }}%</strong>
         <span>待拍 {{ overall.remaining }} 张</span>
+        <span v-if="reviewCount" class="review-inline" data-testid="take-review-banner">
+          待复核 {{ reviewCount }} 条<template v-if="orphanCount">（原帧消失 {{ orphanCount }}）</template>，请到镜头详情处理
+        </span>
       </div>
     </header>
 
@@ -145,16 +159,23 @@ async function removeRow(row: TakeLog) {
         <div class="panel-head"><h2>实拍记录清单</h2><span class="muted">共 {{ takes.length }} 条</span></div>
         <table v-if="takes.length" class="table" data-testid="take-table">
           <thead>
-            <tr><th>拍摄日期</th><th>镜号</th><th>实拍张数</th><th>废帧数</th><th>剩余张数</th><th>完成百分比</th><th>登记时间</th><th>操作</th></tr>
+            <tr><th>拍摄日期</th><th>镜号</th><th>实拍张数</th><th>废帧数</th><th>剩余张数</th><th>完成百分比</th><th>状态</th><th>登记时间</th><th>操作</th></tr>
           </thead>
           <tbody>
-            <tr v-for="row in takes" :key="row.id">
+            <tr v-for="row in takes" :key="row.id" :class="{ review: row.frameUid && row.reviewStatus === '待复核' }">
               <td class="mono">{{ row.date }}</td>
               <td class="mono">{{ row.shotCode }}</td>
               <td>{{ row.takenFrames }}</td>
               <td>{{ row.wastedFrames }}</td>
               <td>{{ row.remainingFrames }}</td>
               <td>{{ row.percent }}%</td>
+              <td>
+                <span v-if="row.frameUid" class="take-state">
+                  <span v-if="row.reviewStatus === '待复核'" class="badge review" :title="row.reviewNote">待复核</span>
+                  <span v-else class="badge shot">帧级已拍</span>
+                </span>
+                <span v-else class="muted">按日汇总</span>
+              </td>
               <td class="muted">{{ formatDateTime(row.updatedAt) }}</td>
               <td><button type="button" class="btn tiny danger" @click="removeRow(row)">删除</button></td>
             </tr>
@@ -197,6 +218,26 @@ h1 {
 .stat-inline strong {
   font-size: 20px;
   color: #2f6fed;
+}
+.review-inline {
+  color: #c45656;
+  font-weight: 600;
+}
+tr.review {
+  background: #fdf8f8;
+}
+.badge {
+  border-radius: 999px;
+  padding: 1px 9px;
+  font-size: 12px;
+}
+.badge.shot {
+  background: #def3e8;
+  color: #2c7c55;
+}
+.badge.review {
+  background: #fdeaea;
+  color: #c45656;
 }
 .two-panel {
   display: grid;

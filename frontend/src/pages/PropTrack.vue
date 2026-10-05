@@ -6,6 +6,7 @@
 import { computed, onMounted, ref, watch } from 'vue';
 import { storeToRefs } from 'pinia';
 import { useShotStore } from '../stores/shotStore';
+import { useShotBatches } from '../hooks/useShotBatches';
 import * as api from '../db/api';
 import { accumulateOffsets, buildCurvePoints, estimateSpeed } from '../utils/frameMath';
 import { formatMm } from '../utils/format';
@@ -35,6 +36,7 @@ const form = ref({
 });
 
 const fixationOptions = FIXATION_OPTIONS;
+const { load: loadBatches, reconcile: reconcileBatches } = useShotBatches(activeShotId, { frames });
 const activeShot = computed(() => (activeShotId.value === null ? undefined : shotStore.byId(activeShotId.value)));
 const orderedFrames = computed(() => frames.value.slice().sort((a, b) => a.frameNo - b.frameNo));
 const offsetSeries = computed(() => accumulateOffsets(orderedFrames.value.map((f) => f.propOffsetMm)));
@@ -77,6 +79,7 @@ async function load(id: number) {
   props.value = await api.listProps(id);
   frames.value = await api.listFrames(id);
   editingId.value = null;
+  await loadBatches();
 }
 
 function flash(text: string) {
@@ -134,13 +137,16 @@ async function submit() {
   }
   await load(activeShotId.value);
   resetForm();
+  const review = await reconcileBatches();
+  if (review > 0) flash(`道具区间已更新，${review} 条帧级实拍与区间错位，已进入镜头详情的待复核队列`);
 }
 
 async function removeProp(id: number | undefined) {
   if (typeof id !== 'number') return;
   await api.deleteProp(id);
   if (activeShotId.value !== null) await load(activeShotId.value);
-  flash('已删除该道具记录');
+  await reconcileBatches();
+  flash('已删除该道具记录，相关批次与复核状态已重算');
 }
 
 /** 把道具位置按帧区间均匀展开，形成位移轨迹点 */

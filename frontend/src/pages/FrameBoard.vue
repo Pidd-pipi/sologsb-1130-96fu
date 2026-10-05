@@ -8,6 +8,7 @@ import { storeToRefs } from 'pinia';
 import { useShotStore } from '../stores/shotStore';
 import { useFrameStore } from '../stores/frameStore';
 import { useFrameSequence } from '../hooks/useFrameSequence';
+import { useShotBatches } from '../hooks/useShotBatches';
 import { useLocalDraft } from '../hooks/useLocalDraft';
 import { durationToFrames, framesToDuration } from '../utils/frameMath';
 import { APERTURE_OPTIONS, EXPOSURE_OPTIONS, ISO_OPTIONS, SHUTTER_ANGLE_OPTIONS } from '../utils/exposure';
@@ -17,6 +18,7 @@ import FrameStrip from '../components/common/FrameStrip.vue';
 import ExposureForm from '../components/common/ExposureForm.vue';
 import EmptyState from '../components/common/EmptyState.vue';
 import StatusTag from '../components/common/StatusTag.vue';
+import BatchPanel from '../components/common/BatchPanel.vue';
 
 const shotStore = useShotStore();
 const frameStore = useFrameStore();
@@ -26,6 +28,20 @@ const { insertAfter, removeAt, move, patch, select, syncShotRange, totalDuration
 
 const activeShotId = ref<number | null>(null);
 const feedback = ref('');
+const {
+  batchViews,
+  reviewCount,
+  shotBatchCount,
+  capacitySec,
+  usedSec,
+  overflowCount,
+  capacityLimit,
+  invalidatedCount,
+  load: loadBatches,
+  reconcile,
+  frameState,
+  clearInvalidationNotice,
+} = useShotBatches(activeShotId, { frames });
 const newFrame = ref<Partial<FrameEntry>>({
   shotCount: 2,
   exposureSec: 0.25,
@@ -58,12 +74,31 @@ onMounted(async () => {
   if (first && typeof first.id === 'number') {
     activeShotId.value = first.id;
     await frameStore.loadForShot(first.id);
+    await loadBatches();
   }
 });
 
 watch(activeShotId, async (id) => {
-  if (typeof id === 'number') await frameStore.loadForShot(id);
+  if (typeof id === 'number') {
+    await frameStore.loadForShot(id);
+    await loadBatches();
+  }
 });
+
+/** 帧序改动后触发批次对账：未拍批次已随派生视图失效重算，已拍错位帧进入待复核 */
+async function afterSequence() {
+  await reconcile();
+  clearInvalidationNotice();
+}
+
+function takeStateMap() {
+  const map: Record<string, NonNullable<ReturnType<typeof frameState>>> = {};
+  for (const f of frames.value) {
+    const state = frameState(f.uid);
+    if (state) map[f.uid] = state;
+  }
+  return map;
+}
 
 function flash(text: string) {
   feedback.value = text;
@@ -80,7 +115,8 @@ async function doInsert() {
     await patch(created.frameNo, newFrame.value);
     select(created.frameNo);
   }
-  flash('已插入一帧并重排序号');
+  await afterSequence();
+  flash('已插入一帧并重排序号，未拍批次已重算');
 }
 
 async function doRemove() {
@@ -89,12 +125,14 @@ async function doRemove() {
     return;
   }
   await removeAt(selectedFrameNo.value);
-  flash('已删除该帧并重排序号');
+  await afterSequence();
+  flash('已删除该帧并重排序号；已拍记录随原帧追踪，原帧消失则进入待复核');
 }
 
 async function doReorder(from: number, to: number) {
   await move(from, to);
-  flash(`已把第 ${from + 1} 个色块移动到第 ${to + 1} 位`);
+  await afterSequence();
+  flash(`已把第 ${from + 1} 个色块移动到第 ${to + 1} 位，未拍批次已重算`);
 }
 
 async function doBatch() {
@@ -117,11 +155,12 @@ async function patchFrame(frameNo: number, value: Partial<FrameEntry>) {
   await patch(frameNo, value);
 }
 
-function shiftFrame(frame: FrameEntry, dir: -1 | 1) {
+async function shiftFrame(frame: FrameEntry, dir: -1 | 1) {
   const index = ordered.value.findIndex((f) => f.frameNo === frame.frameNo);
   const target = index + dir;
   if (target < 0 || target >= ordered.value.length) return;
-  void move(index, target);
+  await move(index, target);
+  await afterSequence();
 }
 </script>
 
@@ -149,6 +188,9 @@ function shiftFrame(frame: FrameEntry, dir: -1 | 1) {
 
     <template v-else-if="activeShot">
       <p v-if="feedback" class="feedback" data-testid="board-feedback">{{ feedback }}</p>
+      <p v-if="invalidatedCount" class="feedback warn" data-testid="batch-invalidated">
+        帧序已改变：{{ invalidatedCount }} 个未拍批次失效并按新帧序 / 道具区间重算；已拍帧继续跟着原帧，错位记录见镜头详情待复核队列。
+      </p>
 
       <div class="stat-row">
         <div class="stat"><span class="label">镜号</span><span class="value small mono">{{ activeShot.code }}</span></div>
@@ -156,6 +198,7 @@ function shiftFrame(frame: FrameEntry, dir: -1 | 1) {
         <div class="stat"><span class="label">计划张数</span><span class="value">{{ planned }}</span></div>
         <div class="stat"><span class="label">当前时长</span><span class="value small">{{ totalDuration }} s</span></div>
         <div class="stat"><span class="label">帧率</span><span class="value small">{{ fps }} fps</span></div>
+        <div class="stat" :class="{ alert: reviewCount }"><span class="label">拍摄批次</span><span class="value small">{{ shotBatchCount }}/{{ batchViews.length }} 批</span><span class="hint" v-if="reviewCount">待复核 {{ reviewCount }} 条</span></div>
       </div>
 
       <div class="panel">
@@ -167,7 +210,22 @@ function shiftFrame(frame: FrameEntry, dir: -1 | 1) {
             <button type="button" class="btn small" @click="syncShotRange">重算时长</button>
           </div>
         </div>
-        <FrameStrip :frames="ordered" :selected="selectedFrameNo" @update:selected="select" @reorder="doReorder" @patch="patchFrame" />
+        <FrameStrip :frames="ordered" :selected="selectedFrameNo" :take-states="takeStateMap()" @update:selected="select" @reorder="doReorder" @patch="patchFrame" />
+      </div>
+
+      <div class="panel" data-testid="board-batch-section">
+        <div class="panel-head">
+          <h2>拍摄批次预览</h2>
+          <span class="muted">180 秒容量 · 道具区间不拆 · 帧序一改未拍批次立即重算</span>
+        </div>
+        <BatchPanel
+          readonly
+          :batches="batchViews"
+          :used-sec="usedSec"
+          :capacity-sec="capacitySec"
+          :capacity-limit="capacityLimit"
+          :overflow-count="overflowCount"
+        />
       </div>
 
       <div class="two-panel">
@@ -219,7 +277,7 @@ function shiftFrame(frame: FrameEntry, dir: -1 | 1) {
             <tr><th>位次</th><th>帧号</th><th>张数</th><th>曝光 s</th><th>光圈</th><th>ISO</th><th>位移 mm</th><th>操作</th></tr>
           </thead>
           <tbody>
-            <tr v-for="(frame, index) in ordered" :key="frame.id ?? index" :class="{ active: frame.frameNo === selectedFrameNo }" @click="select(frame.frameNo)">
+            <tr v-for="(frame, index) in ordered" :key="frame.uid ?? index" :class="{ active: frame.frameNo === selectedFrameNo }" @click="select(frame.frameNo)">
               <td>{{ index + 1 }}</td>
               <td class="mono">{{ frame.frameNo }}</td>
               <td>{{ frame.shotCount }} 张</td>
@@ -422,5 +480,17 @@ h1 {
   border-radius: 8px;
   padding: 8px 12px;
   font-size: 13px;
+}
+.feedback.warn {
+  background: #fff8ec;
+  border-color: #f2d9a7;
+  color: #9a6a12;
+}
+.stat.alert {
+  border-color: #f0c8c8;
+}
+.stat.alert .hint {
+  color: #c45656;
+  font-weight: 600;
 }
 </style>

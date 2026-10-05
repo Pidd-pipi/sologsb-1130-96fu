@@ -9,13 +9,16 @@ import { storeToRefs } from 'pinia';
 import { useShotStore } from '../stores/shotStore';
 import { useFrameStore } from '../stores/frameStore';
 import { useProgress } from '../hooks/useProgress';
-import { listAllFrames } from '../db/api';
+import { listAllFrames, listAllTakes, listAllProps } from '../db/api';
 import { framesToDuration } from '../utils/frameMath';
+import { summarizeShotBatches, BATCH_CAPACITY_SEC } from '../utils/batchMath';
 import { formatDateTime } from '../utils/format';
 import ShotProgress from '../components/common/ShotProgress.vue';
 import StatusTag from '../components/common/StatusTag.vue';
 import EmptyState from '../components/common/EmptyState.vue';
 import type { FrameEntry } from '../types/frame';
+import type { PropState } from '../types/prop';
+import type { TakeLog } from '../types/take';
 
 const router = useRouter();
 const shotStore = useShotStore();
@@ -24,11 +27,16 @@ const { shots } = storeToRefs(shotStore);
 const { summaries, overall, loadTakes, loading } = useProgress();
 
 const allFrames = ref<FrameEntry[]>([]);
+const allProps = ref<PropState[]>([]);
+const allTakes = ref<TakeLog[]>([]);
 
 onMounted(async () => {
   await shotStore.load();
   await loadTakes();
-  allFrames.value = await listAllFrames();
+  const [frames, props, takes] = await Promise.all([listAllFrames(), listAllProps(), listAllTakes()]);
+  allFrames.value = frames;
+  allProps.value = props;
+  allTakes.value = takes;
 });
 
 const summaryOf = (shotId: number | undefined) => summaries.value.find((s) => s.shotId === shotId);
@@ -36,14 +44,33 @@ const summaryOf = (shotId: number | undefined) => summaries.value.find((s) => s.
 const rows = computed(() =>
   shots.value.map((shot) => {
     const frames = allFrames.value.filter((f) => f.shotId === shot.id);
+    const props = allProps.value.filter((p) => p.shotId === shot.id);
+    const takes = allTakes.value.filter((t) => t.shotId === shot.id);
     const summary = summaryOf(shot.id);
     return {
       shot,
       frameCount: frames.length,
       duration: framesToDuration(shot.endFrame - shot.startFrame + 1, shot.fps),
       summary,
+      batches: summarizeShotBatches(frames, props, takes),
     };
   }),
+);
+
+/** 全片批次容量与待复核数 */
+const batchTotals = computed(() =>
+  rows.value.reduce(
+    (acc, row) => {
+      acc.batchCount += row.batches.batchCount;
+      acc.shotBatchCount += row.batches.shotBatchCount;
+      acc.usedSec = Math.round((acc.usedSec + row.batches.usedSec) * 1000) / 1000;
+      acc.capacitySec += row.batches.capacitySec;
+      acc.overflow += row.batches.overflowCount;
+      acc.review += row.batches.reviewCount;
+      return acc;
+    },
+    { batchCount: 0, shotBatchCount: 0, usedSec: 0, capacitySec: 0, overflow: 0, review: 0 },
+  ),
 );
 
 const waitingFrames = computed(() => overall.value.remaining);
@@ -94,6 +121,19 @@ function goDetail(id: number | undefined) {
         <span class="value">{{ waitingFrames }}</span>
         <span class="hint">整体完成 {{ overall.percent }}%</span>
       </div>
+      <div class="stat" data-testid="overview-batch-capacity">
+        <span class="label">拍摄批次容量</span>
+        <span class="value">{{ batchTotals.usedSec }} / {{ batchTotals.capacitySec }} 秒</span>
+        <span class="hint">
+          {{ batchTotals.batchCount }} 批（已拍 {{ batchTotals.shotBatchCount }}）· 每批 {{ BATCH_CAPACITY_SEC }} 秒
+          <template v-if="batchTotals.overflow"> · 溢出 {{ batchTotals.overflow }} 批</template>
+        </span>
+      </div>
+      <div class="stat" :class="{ alert: batchTotals.review > 0 }" data-testid="overview-review">
+        <span class="label">待复核实拍</span>
+        <span class="value">{{ batchTotals.review }}</span>
+        <span class="hint">原帧消失或离开原道具区间的实拍记录</span>
+      </div>
     </div>
 
     <div class="panel">
@@ -120,6 +160,8 @@ function goDetail(id: number | undefined) {
             <th>帧区间</th>
             <th>帧条目</th>
             <th>预计时长</th>
+            <th>拍摄批次</th>
+            <th>待复核</th>
             <th>完成度</th>
             <th>负责人</th>
             <th>操作</th>
@@ -134,6 +176,15 @@ function goDetail(id: number | undefined) {
             <td class="mono">{{ row.shot.startFrame }} – {{ row.shot.endFrame }}</td>
             <td>{{ row.frameCount }}</td>
             <td>{{ row.duration }} s</td>
+            <td class="batch-cell">
+              <div class="cap-bar"><div class="cap-fill" :style="{ width: Math.min(100, (row.batches.usedSec / Math.max(1, row.batches.capacitySec)) * 100) + '%' }"></div></div>
+              <span class="muted">{{ row.batches.shotBatchCount }}/{{ row.batches.batchCount }} 批 · {{ Math.round(row.batches.usedSec) }}/{{ row.batches.capacitySec }} 秒</span>
+              <span v-if="row.batches.overflowCount" class="warn"> · 溢出 {{ row.batches.overflowCount }}</span>
+            </td>
+            <td>
+              <span v-if="row.batches.reviewCount" class="review-pill">{{ row.batches.reviewCount }} 条</span>
+              <span v-else class="muted">0</span>
+            </td>
             <td class="progress-cell">
               <ShotProgress
                 compact
@@ -210,6 +261,39 @@ h1 {
 .stat .hint {
   font-size: 12px;
   color: #8a94a6;
+}
+.stat.alert {
+  border-color: #f0c8c8;
+  background: #fdf8f8;
+}
+.stat.alert .value {
+  color: #c45656;
+}
+.batch-cell {
+  min-width: 170px;
+}
+.cap-bar {
+  height: 6px;
+  border-radius: 6px;
+  background: #edf0f5;
+  overflow: hidden;
+  margin-bottom: 3px;
+}
+.cap-fill {
+  height: 100%;
+  background: #2f6fed;
+  border-radius: 6px;
+}
+.warn {
+  color: #c47f17;
+}
+.review-pill {
+  background: #fdeaea;
+  color: #c45656;
+  border-radius: 999px;
+  padding: 1px 10px;
+  font-size: 12px;
+  font-weight: 600;
 }
 .panel {
   background: #fff;

@@ -3,6 +3,7 @@ import { defineStore } from 'pinia';
 import * as api from '../db/api';
 import { toPlain } from '../db';
 import { buildFrameRange, framesToDuration } from '../utils/frameMath';
+import { newFrameUid } from '../utils/identity';
 import type { Shot } from '../types/shot';
 import { createEmptyShot } from '../types/shot';
 import type { FrameEntry } from '../types/frame';
@@ -110,6 +111,6 @@ export const useShotStore = defineStore('shot', {
 
 /** 新建镜头时生成首个帧条目 */
 export function firstFrameOf(shot: Shot): FrameEntry {
-  const frame = createEmptyFrame(shot.id ?? 0, shot.startFrame);
+  const frame = createEmptyFrame(shot.id ?? 0, shot.startFrame, newFrameUid());
   return frame;
 }

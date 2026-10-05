@@ -10,6 +10,7 @@ import { useFrameStore } from '../stores/frameStore';
 import { useLocalDraft } from '../hooks/useLocalDraft';
 import { buildFrameRange, framesToDuration } from '../utils/frameMath';
 import { addFrames } from '../db/api';
+import { newFrameUid } from '../utils/identity';
 import { FPS_OPTIONS, SHOT_STATUS_OPTIONS, type ShotStatus } from '../types/shot';
 import { createEmptyFrame, type FrameEntry } from '../types/frame';
 import ExposureForm from '../components/common/ExposureForm.vue';
@@ -92,7 +93,11 @@ async function submit() {
       status: draft.value.status,
       owner: draft.value.owner.trim(),
     });
-    const first: FrameEntry = { ...createEmptyFrame(shot.id as number, shot.startFrame), ...exposure.value, id: undefined };
+    const first: FrameEntry = {
+      ...createEmptyFrame(shot.id as number, shot.startFrame, newFrameUid()),
+      ...exposure.value,
+      id: undefined,
+    };
     await addFrames([first]);
     await frameStore.loadForShot(shot.id as number);
     reset();

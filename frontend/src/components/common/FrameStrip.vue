@@ -8,18 +8,22 @@ import { computed, ref } from 'vue';
 import type { FrameEntry, ShotCount } from '../../types/frame';
 import { SHOT_COUNT_OPTIONS } from '../../types/frame';
 import { frameColor, type FrameColorInput } from '../../utils/frameMath';
+import type { FrameTakeState } from '../../hooks/useShotBatches';
 
 interface Props {
   frames: FrameEntry[];
   selected?: number | null;
   readonly?: boolean;
   colorBy?: 'offset' | 'exposure';
+  /** frameUid → 实拍状态（已拍角标 / 待复核角标），缺省时不渲染 */
+  takeStates?: Record<string, FrameTakeState>;
 }
 
 const props = withDefaults(defineProps<Props>(), {
   selected: null,
   readonly: false,
   colorBy: 'offset',
+  takeStates: () => ({}),
 });
 
 const emit = defineEmits<{
@@ -68,6 +72,17 @@ const totalOffset = computed(() =>
 );
 
 const shotCountOptions = SHOT_COUNT_OPTIONS;
+
+function takeStateOf(frame: FrameEntry): FrameTakeState | undefined {
+  return props.takeStates[frame.uid];
+}
+
+const takenFramesCount = computed(() =>
+  props.frames.reduce((sum, f) => sum + (props.takeStates[f.uid]?.takenFrames ?? 0), 0),
+);
+const reviewFramesCount = computed(
+  () => props.frames.filter((f) => props.takeStates[f.uid]?.reviewStatus === '待复核').length,
+);
 </script>
 
 <template>
@@ -75,24 +90,39 @@ const shotCountOptions = SHOT_COUNT_OPTIONS;
     <div class="strip-meta">
       <span>帧序条带：{{ frames.length }} 帧</span>
       <span>位移合计 {{ totalOffset }} mm</span>
+      <span v-if="takenFramesCount" class="shot-meta">已拍 {{ takenFramesCount }} 张</span>
+      <span v-if="reviewFramesCount" class="review-meta">待复核 {{ reviewFramesCount }} 帧</span>
       <span v-if="!readonly" class="hint">点击选中 · 拖拽换序</span>
     </div>
 
     <div class="strip-track">
       <div
         v-for="(frame, index) in frames"
-        :key="frame.frameNo"
+        :key="frame.uid ?? frame.frameNo"
         class="strip-cell"
-        :class="{ active: frame.frameNo === selected, readonly }"
+        :class="{
+          active: frame.frameNo === selected,
+          readonly,
+          shot: !!takeStateOf(frame),
+          review: takeStateOf(frame)?.reviewStatus === '待复核',
+        }"
         :style="{ background: colorOf(frame) }"
         :draggable="!readonly"
         :data-testid="`strip-cell-${frame.frameNo}`"
-        :title="`第 ${frame.frameNo} 帧 · ${frame.shotCount} 张 · ${frame.exposureSec}s · f/${frame.aperture} · ISO${frame.iso} · 位移 ${frame.propOffsetMm}mm`"
+        :title="`第 ${frame.frameNo} 帧 · ${frame.shotCount} 张 · ${frame.exposureSec}s · f/${frame.aperture} · ISO${frame.iso} · 位移 ${frame.propOffsetMm}mm${takeStateOf(frame) ? ` · 已拍 ${takeStateOf(frame)?.takenFrames} 张${takeStateOf(frame)?.reviewStatus === '待复核' ? '（待复核）' : ''}` : ''}`"
         @click="onSelect(frame.frameNo)"
         @dragstart="onDragStart(index, $event)"
         @dragover.prevent
         @drop="onDrop(index)"
       >
+        <span
+          v-if="takeStateOf(frame)"
+          class="cell-badge"
+          :class="{ review: takeStateOf(frame)?.reviewStatus === '待复核' }"
+          :title="takeStateOf(frame)?.reviewStatus === '待复核' ? `待复核：${takeStateOf(frame)?.reviewNote ?? ''}` : `${takeStateOf(frame)?.date} 实拍`"
+        >
+          {{ takeStateOf(frame)?.reviewStatus === '待复核' ? '⚠' : '✓' }}{{ takeStateOf(frame)?.takenFrames }}
+        </span>
         <span class="cell-no">{{ frame.frameNo }}</span>
         <span class="cell-sub">{{ frame.shotCount }}张</span>
         <span class="cell-sub">{{ frame.propOffsetMm }}mm</span>
@@ -198,6 +228,7 @@ const shotCountOptions = SHOT_COUNT_OPTIONS;
   padding-bottom: 6px;
 }
 .strip-cell {
+  position: relative;
   min-width: 54px;
   height: 74px;
   border-radius: 8px;
@@ -218,6 +249,35 @@ const shotCountOptions = SHOT_COUNT_OPTIONS;
 .strip-cell.active {
   border-color: #1f2d3d;
   box-shadow: 0 0 0 2px rgba(31, 45, 61, 0.18);
+}
+.strip-cell.shot {
+  box-shadow: inset 0 0 0 2px rgba(58, 166, 117, 0.85);
+}
+.strip-cell.review {
+  box-shadow: inset 0 0 0 2px rgba(196, 86, 86, 0.9);
+}
+.cell-badge {
+  position: absolute;
+  top: 2px;
+  right: 3px;
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1.4;
+  padding: 0 4px;
+  border-radius: 8px;
+  background: rgba(58, 166, 117, 0.95);
+  color: #fff;
+}
+.cell-badge.review {
+  background: rgba(196, 86, 86, 0.95);
+}
+.shot-meta {
+  color: #2c7c55;
+  font-weight: 600;
+}
+.review-meta {
+  color: #c45656;
+  font-weight: 600;
 }
 .strip-cell.readonly {
   cursor: default;
